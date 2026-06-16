@@ -5,7 +5,7 @@ I made this for those who aren't big time picky, or just for those who want a ta
 
 Not the best thing, but still something.
 # How Install? What do I do with the code?
-1. Get Windhawk: [Windhawk](https://windhawk.net/)
+1. Get [Windhawk](https://windhawk.net/)
 2. In Windhawk click on (Create a New Mod)
 <img width="500" height="600" alt="image" src="https://github.com/user-attachments/assets/47bad86a-3c54-42d8-8563-106ea2c0e8de" />
 
