@@ -2,10 +2,10 @@
 // @id           taskmgr-dark-mode-native
 // @name         Task Manager Native Dark Mode Fix
 // @description  Forces Task Manager into a native dark theme with perfect white chevrons, white tab text, dark title bars, dark top menu bars, and pitch black performance graphs.
-// @version      1.9.12
+// @version      1.9.13
 // @author       Me
 // @include      taskmgr.exe
-// @compilerOptions -luxtheme -lgdi32 -luser32 -lcomctl32 -ldwmapi
+// @compilerOptions -luxtheme -lgdi32 -luser32 -lcomctl32 -ldwmapi -lmsimg32
 // ==/WindhawkMod==
 
 #include <windows.h>
@@ -23,8 +23,6 @@ enum AppMode { Default, AllowDark, ForceDark, ForceLight, Max };
 pfnSetPreferredAppMode SetPreferredAppMode = NULL;
 pfnAllowDarkModeForWindow AllowDarkModeForWindow = NULL;
 pfnFlushMenuThemes FlushMenuThemes = NULL;
-
-
 
 struct ThemeTracking {
     HTHEME hTheme;
@@ -175,6 +173,39 @@ typedef int (WINAPI* pfnDrawTextExW)(HDC hdc, LPWSTR lpchText, int cchText, LPRE
 pfnDrawTextW real_DrawTextW = DrawTextW;
 pfnDrawTextExW real_DrawTextExW = DrawTextExW;
 
+// Track which windows have been subclassed to prevent double-subclassing
+struct SubclassInfo {
+    HWND hwnd;
+    bool isSubclassed;
+};
+SubclassInfo g_SubclassList[256] = {0};
+int g_SubclassCount = 0;
+
+bool IsWindowSubclassed(HWND hwnd) {
+    for (int i = 0; i < g_SubclassCount; i++) {
+        if (g_SubclassList[i].hwnd == hwnd) {
+            return g_SubclassList[i].isSubclassed;
+        }
+    }
+    return false;
+}
+
+void MarkWindowSubclassed(HWND hwnd) {
+    // Check if already tracked
+    for (int i = 0; i < g_SubclassCount; i++) {
+        if (g_SubclassList[i].hwnd == hwnd) {
+            g_SubclassList[i].isSubclassed = true;
+            return;
+        }
+    }
+    // Add new entry if space available
+    if (g_SubclassCount < 256) {
+        g_SubclassList[g_SubclassCount].hwnd = hwnd;
+        g_SubclassList[g_SubclassCount].isSubclassed = true;
+        g_SubclassCount++;
+    }
+}
+
 COLORREF GetTargetBgColor(HDC hdc) {
     if (hdc) {
         HWND hwnd = GetWindowFromDCExtended(hdc);
@@ -246,25 +277,38 @@ LRESULT CALLBACK TaskMgrSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
         case WM_CTLCOLORDLG:
         case WM_CTLCOLORSTATIC:
         case WM_CTLCOLORBTN:
-        case WM_CTLCOLORLISTBOX: {
+        case WM_CTLCOLORLISTBOX:
+        case WM_CTLCOLOREDIT: {
             HDC hdc = (HDC)wParam;
             COLORREF bgCol = GetTargetBgColor(hdc);
-            real_SetBkColor(hdc, bgCol);
-            real_SetTextColor(hdc, RGB(255, 255, 255));
+            if (real_SetBkColor) real_SetBkColor(hdc, bgCol);
+            if (real_SetTextColor) real_SetTextColor(hdc, RGB(255, 255, 255));
             
-            HBRUSH hBrush = real_CreateSolidBrush(bgCol);
-            return (LRESULT)hBrush;
+            // FIX: Use cached brushes to prevent GDI object leak
+            static HBRUSH hDarkBrush = NULL;
+            static HBRUSH hBlackBrush = NULL;
+            if (!hDarkBrush && real_CreateSolidBrush) hDarkBrush = real_CreateSolidBrush(RGB(15, 15, 15));
+            if (!hBlackBrush && real_CreateSolidBrush) hBlackBrush = real_CreateSolidBrush(RGB(0, 0, 0));
+            
+            WCHAR szClass[64] = {0};
+            GetClassNameW(hwnd, szClass, 64);
+            if (wcscmp(szClass, L"NativeHWNDHost") == 0 && hBlackBrush) {
+                return (LRESULT)hBlackBrush;
+            }
+            return (LRESULT)(hDarkBrush ? hDarkBrush : GetStockObject(DKGRAY_BRUSH));
         }
         case WM_ERASEBKGND: {
             HDC hdc = (HDC)wParam;
             RECT rc;
             GetClientRect(hwnd, &rc);
-            HBRUSH hBrush = real_CreateSolidBrush(GetTargetBgColor(hdc));
-            real_FillRect(hdc, &rc, hBrush);
-            DeleteObject(hBrush);
+            // FIX: Use cached brush instead of creating/deleting per erase
+            static HBRUSH hEraseBrush = NULL;
+            if (!hEraseBrush && real_CreateSolidBrush) hEraseBrush = real_CreateSolidBrush(GetTargetBgColor(hdc));
+            if (hEraseBrush && real_FillRect) {
+                real_FillRect(hdc, &rc, hEraseBrush);
+            }
             return 1;
         }
-        // Force title bar attributes continuously when window state triggers non-client repaints
         case WM_NCACTIVATE:
         case WM_NCPAINT:
         case WM_WINDOWPOSCHANGED: {
@@ -288,17 +332,33 @@ LRESULT CALLBACK TaskMgrSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
 void ApplyImmersiveDarkMode(HWND hwnd) {
     if (!hwnd) return;
     
+    // Prevent double-subclassing
+    if (IsWindowSubclassed(hwnd)) {
+        return;
+    }
+    
     WCHAR szClass[64] = {0};
     GetClassNameW(hwnd, szClass, 64);
+    
+    // CRITICAL FIX: Skip standard Windows dialogs to prevent crashes in "Run new task"
+    // These classes are used by common dialogs like Open/Save/Run
+    if (wcscmp(szClass, L"#32770") == 0 || // Dialog box
+        wcscmp(szClass, L"Edit") == 0 ||
+        wcscmp(szClass, L"Button") == 0 ||
+        wcscmp(szClass, L"ComboBox") == 0 ||
+        wcscmp(szClass, L"ListBox") == 0) {
+        return; 
+    }
+
     BOOL isTopLevel = !(GetWindowLongW(hwnd, GWL_STYLE) & WS_CHILD);
 
     if (AllowDarkModeForWindow) AllowDarkModeForWindow(hwnd, TRUE);
     
     // Prevent overriding the primary window frame layout with wrong explorer metrics
     if (wcscmp(szClass, L"TaskManagerWindow") == 0 || isTopLevel) {
-        real_SetWindowTheme(hwnd, L"DarkMode", NULL);
+        if (real_SetWindowTheme) real_SetWindowTheme(hwnd, L"DarkMode", NULL);
     } else {
-        real_SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
+        if (real_SetWindowTheme) real_SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
     }
 
     if (isTopLevel && real_DwmSetWindowAttribute) {
@@ -313,11 +373,12 @@ void ApplyImmersiveDarkMode(HWND hwnd) {
     }
     
     SetWindowSubclass(hwnd, TaskMgrSubclassProc, THEME_SUBCLASS_ID, 0);
+    MarkWindowSubclassed(hwnd);
     SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
 }
 
 HDC WINAPI CreateCompatibleDC_Hook(HDC hdc) {
-    HDC hNewDC = real_CreateCompatibleDC(hdc);
+    HDC hNewDC = real_CreateCompatibleDC ? real_CreateCompatibleDC(hdc) : NULL;
     if (hNewDC && hdc) {
         HWND hwnd = WindowFromDC(hdc);
         if (hwnd) {
@@ -329,7 +390,7 @@ HDC WINAPI CreateCompatibleDC_Hook(HDC hdc) {
 
 BOOL WINAPI DeleteDC_Hook(HDC hdc) {
     UnregisterDC(hdc);
-    return real_DeleteDC(hdc);
+    return real_DeleteDC ? real_DeleteDC(hdc) : FALSE;
 }
 
 COLORREF WINAPI GetSysColor_Hook(int nIndex) {
@@ -341,19 +402,21 @@ COLORREF WINAPI GetSysColor_Hook(int nIndex) {
         case COLOR_MENUBAR:     case COLOR_MENU:       return RGB(15, 15, 15);
         case COLOR_ACTIVEBORDER:                       return RGB(35, 35, 35);
     }
-    return real_GetSysColor(nIndex);
+    return real_GetSysColor ? real_GetSysColor(nIndex) : GetSysColor(nIndex);
 }
 
 HBRUSH WINAPI GetSysColorBrush_Hook(int nIndex) {
     switch (nIndex) {
-        case COLOR_WINDOW:     case COLOR_BACKGROUND: { static HBRUSH b = NULL; if(!b) b = real_CreateSolidBrush(RGB(15, 15, 15)); return b; }
-        case COLOR_BTNFACE:                           { static HBRUSH b = NULL; if(!b) b = real_CreateSolidBrush(RGB(25, 25, 25)); return b; }
-        case COLOR_MENU:       case COLOR_MENUBAR:    { static HBRUSH b = NULL; if(!b) b = real_CreateSolidBrush(RGB(15, 15, 15)); return b; }
+        case COLOR_WINDOW:     case COLOR_BACKGROUND: { static HBRUSH b = NULL; if(!b && real_CreateSolidBrush) b = real_CreateSolidBrush(RGB(15, 15, 15)); return b; }
+        case COLOR_BTNFACE:                           { static HBRUSH b = NULL; if(!b && real_CreateSolidBrush) b = real_CreateSolidBrush(RGB(25, 25, 25)); return b; }
+        case COLOR_MENU:       case COLOR_MENUBAR:    { static HBRUSH b = NULL; if(!b && real_CreateSolidBrush) b = real_CreateSolidBrush(RGB(15, 15, 15)); return b; }
     }
-    return real_GetSysColorBrush(nIndex);
+    return real_GetSysColorBrush ? real_GetSysColorBrush(nIndex) : GetSysColorBrush(nIndex);
 }
 
 COLORREF WINAPI SetTextColor_Hook(HDC hdc, COLORREF color) {
+    if (!real_SetTextColor) return color;
+    
     HWND hwnd = GetWindowFromDCExtended(hdc);
     if (hwnd) {
         WCHAR szClass[64] = {0};
@@ -389,18 +452,23 @@ COLORREF WINAPI SetTextColor_Hook(HDC hdc, COLORREF color) {
 }
 
 COLORREF WINAPI SetBkColor_Hook(HDC hdc, COLORREF color) {
+    if (!real_SetBkColor) return color;
     return real_SetBkColor(hdc, ConvertTaskMgrColor(color, hdc));
 }
 
 HBRUSH WINAPI CreateSolidBrush_Hook(COLORREF color) {
+    if (!real_CreateSolidBrush) return CreateSolidBrush(color);
     return real_CreateSolidBrush(ConvertTaskMgrColor(color, NULL));
 }
 
 COLORREF WINAPI SetDCBrushColor_Hook(HDC hdc, COLORREF color) {
+    if (!real_SetDCBrushColor) return color;
     return real_SetDCBrushColor(hdc, ConvertTaskMgrColor(color, hdc));
 }
 
 COLORREF WINAPI SetDCPenColor_Hook(HDC hdc, COLORREF color) {
+    if (!real_SetDCPenColor) return color;
+    
     BYTE r = GetRValue(color);
     BYTE g = GetGValue(color);
     BYTE b = GetBValue(color);
@@ -411,6 +479,8 @@ COLORREF WINAPI SetDCPenColor_Hook(HDC hdc, COLORREF color) {
 }
 
 HPEN WINAPI CreatePen_Hook(int iStyle, int cWidth, COLORREF color) {
+    if (!real_CreatePen) return CreatePen(iStyle, cWidth, color);
+    
     BYTE r = GetRValue(color);
     BYTE g = GetGValue(color);
     BYTE b = GetBValue(color);
@@ -421,6 +491,8 @@ HPEN WINAPI CreatePen_Hook(int iStyle, int cWidth, COLORREF color) {
 }
 
 HPEN WINAPI CreatePenIndirect_Hook(const LOGPEN *plp) {
+    if (!real_CreatePenIndirect) return CreatePenIndirect(plp);
+    
     if (plp) {
         BYTE r = GetRValue(plp->lopnColor);
         BYTE g = GetGValue(plp->lopnColor);
@@ -437,57 +509,79 @@ HPEN WINAPI CreatePenIndirect_Hook(const LOGPEN *plp) {
 HGDIOBJ WINAPI GetStockObject_Hook(int fnObject) {
     if (fnObject == WHITE_BRUSH) {
         static HBRUSH darkBrush = NULL;
-        if (!darkBrush) darkBrush = real_CreateSolidBrush(RGB(15, 15, 15));
-        return darkBrush;
+        if (!darkBrush && real_CreateSolidBrush) darkBrush = real_CreateSolidBrush(RGB(15, 15, 15));
+        return darkBrush ? darkBrush : real_GetStockObject(fnObject);
     }
     if (fnObject == LTGRAY_BRUSH) {
         static HBRUSH darkBrush = NULL;
-        if (!darkBrush) darkBrush = real_CreateSolidBrush(RGB(25, 25, 25));
-        return darkBrush;
+        if (!darkBrush && real_CreateSolidBrush) darkBrush = real_CreateSolidBrush(RGB(25, 25, 25));
+        return darkBrush ? darkBrush : real_GetStockObject(fnObject);
     }
-    return real_GetStockObject(fnObject);
+    return real_GetStockObject ? real_GetStockObject(fnObject) : GetStockObject(fnObject);
 }
 
 BOOL WINAPI PatBlt_Hook(HDC hdc, int x, int y, int w, int h, DWORD dwRop) {
+    if (!real_PatBlt || !real_CreateSolidBrush || !real_FillRect) {
+        return PatBlt(hdc, x, y, w, h, dwRop);
+    }
+    
     if (dwRop == WHITENESS || dwRop == BLACKNESS) {
         RECT r = { x, y, x + w, y + h };
         HBRUSH hDark = real_CreateSolidBrush(GetTargetBgColor(hdc));
-        real_FillRect(hdc, &r, hDark);
-        DeleteObject(hDark);
-        return TRUE;
+        if (hDark) {
+            real_FillRect(hdc, &r, hDark);
+            DeleteObject(hDark);
+            return TRUE;
+        }
     }
     return real_PatBlt(hdc, x, y, w, h, dwRop);
 }
 
 BOOL WINAPI BitBlt_Hook(HDC hdc, int x, int y, int cx, int cy, HDC hdcSrc, int x1, int y1, DWORD rop) {
+    if (!real_BitBlt || !real_CreateSolidBrush || !real_FillRect) {
+        return BitBlt(hdc, x, y, cx, cy, hdcSrc, x1, y1, rop);
+    }
+    
     if (rop == WHITENESS || rop == BLACKNESS) {
         RECT r = { x, y, x + cx, y + cy };
         HBRUSH hDark = real_CreateSolidBrush(GetTargetBgColor(hdc));
-        real_FillRect(hdc, &r, hDark);
-        DeleteObject(hDark);
-        return TRUE;
+        if (hDark) {
+            real_FillRect(hdc, &r, hDark);
+            DeleteObject(hDark);
+            return TRUE;
+        }
     }
     return real_BitBlt(hdc, x, y, cx, cy, hdcSrc, x1, y1, rop);
 }
 
 BOOL WINAPI StretchBlt_Hook(HDC hdcDest, int xDest, int yDest, int wDest, int hDest, HDC hdcSrc, int xSrc, int ySrc, int wSrc, int hSrc, DWORD rop) {
+    if (!real_StretchBlt || !real_CreateSolidBrush || !real_FillRect) {
+        return StretchBlt(hdcDest, xDest, yDest, wDest, hDest, hdcSrc, xSrc, ySrc, wSrc, hSrc, rop);
+    }
+    
     if (rop == WHITENESS || rop == BLACKNESS) {
         RECT r = { xDest, yDest, xDest + wDest, yDest + hDest };
         HBRUSH hDark = real_CreateSolidBrush(GetTargetBgColor(hdcDest));
-        real_FillRect(hdcDest, &r, hDark);
-        DeleteObject(hDark);
-        return TRUE;
+        if (hDark) {
+            real_FillRect(hdcDest, &r, hDark);
+            DeleteObject(hDark);
+            return TRUE;
+        }
     }
     return real_StretchBlt(hdcDest, xDest, yDest, wDest, hDest, hdcSrc, xSrc, ySrc, wSrc, hSrc, rop);
 }
 
 HTHEME WINAPI OpenThemeData_Hook(HWND hwnd, LPCWSTR pszClassList) {
-    HTHEME hTheme = real_OpenThemeData(hwnd, pszClassList);
+    HTHEME hTheme = real_OpenThemeData ? real_OpenThemeData(hwnd, pszClassList) : OpenThemeData(hwnd, pszClassList);
     if (hTheme && pszClassList) RegisterTheme(hTheme, pszClassList);
     return hTheme;
 }
 
 HRESULT WINAPI DrawThemeBackground_Hook(HTHEME hTheme, HDC hdc, int iPartId, int iStateId, const RECT *pRect, const RECT *pClipRect) {
+    if (!real_DrawThemeBackground) {
+        return DrawThemeBackground(hTheme, hdc, iPartId, iStateId, pRect, pClipRect);
+    }
+    
     LPCWSTR cls = hTheme ? GetThemeClassName(hTheme) : NULL;
     
     HWND hwnd = WindowFromDC(hdc);
@@ -496,10 +590,11 @@ HRESULT WINAPI DrawThemeBackground_Hook(HTHEME hTheme, HDC hdc, int iPartId, int
         GetClassNameW(hwnd, szClass, 64);
         
         // FIX 1: Force the topmost title bar / caption frame to turn black
-        if (wcscmp(szClass, L"TaskManagerWindow") == 0) {
+        // Use the hooked version to avoid recursion issues
+        if (wcscmp(szClass, L"TaskManagerWindow") == 0 && real_DwmSetWindowAttribute) {
             BOOL useDarkMode = TRUE;
-            DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &useDarkMode, sizeof(useDarkMode));
-            DwmSetWindowAttribute(hwnd, 19, &useDarkMode, sizeof(useDarkMode)); // Fallback for older Win10 builds
+            real_DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &useDarkMode, sizeof(useDarkMode));
+            real_DwmSetWindowAttribute(hwnd, 19, &useDarkMode, sizeof(useDarkMode)); // Fallback for older Win10 builds
         }
     }
 
@@ -512,9 +607,13 @@ HRESULT WINAPI DrawThemeBackground_Hook(HTHEME hTheme, HDC hdc, int iPartId, int
     
     if (isMenu) {
         if (iPartId == 7) { // MENU_BARBACKGROUND
-            HBRUSH hBrush = real_CreateSolidBrush(RGB(0, 0, 0)); // Pure Black
-            real_FillRect(hdc, pRect, hBrush);
-            DeleteObject(hBrush);
+            if (real_CreateSolidBrush && real_FillRect) {
+                HBRUSH hBrush = real_CreateSolidBrush(RGB(0, 0, 0)); // Pure Black
+                if (hBrush) {
+                    real_FillRect(hdc, pRect, hBrush);
+                    DeleteObject(hBrush);
+                }
+            }
             return S_OK;
         }
         if (iPartId == 8) { // MENU_BARITEM
@@ -522,15 +621,23 @@ HRESULT WINAPI DrawThemeBackground_Hook(HTHEME hTheme, HDC hdc, int iPartId, int
             if (iStateId == 2 || iStateId == 3) { // MBI_HOT or MBI_PUSHED
                 bg = RGB(55, 55, 55); 
             }
-            HBRUSH hBrush = real_CreateSolidBrush(bg);
-            real_FillRect(hdc, pRect, hBrush);
-            DeleteObject(hBrush);
+            if (real_CreateSolidBrush && real_FillRect) {
+                HBRUSH hBrush = real_CreateSolidBrush(bg);
+                if (hBrush) {
+                    real_FillRect(hdc, pRect, hBrush);
+                    DeleteObject(hBrush);
+                }
+            }
             return S_OK;
         }
         if (iPartId == 9) { // MENU_POPUPBACKGROUND
-            HBRUSH hBrush = real_CreateSolidBrush(RGB(25, 25, 25));
-            real_FillRect(hdc, pRect, hBrush);
-            DeleteObject(hBrush);
+            if (real_CreateSolidBrush && real_FillRect) {
+                HBRUSH hBrush = real_CreateSolidBrush(RGB(25, 25, 25));
+                if (hBrush) {
+                    real_FillRect(hdc, pRect, hBrush);
+                    DeleteObject(hBrush);
+                }
+            }
             return S_OK;
         }
         if (iPartId == 14) { // MENU_POPUPITEM
@@ -538,9 +645,13 @@ HRESULT WINAPI DrawThemeBackground_Hook(HTHEME hTheme, HDC hdc, int iPartId, int
             if (iStateId == 2) { // MPI_HOT
                 bg = RGB(50, 50, 50);
             }
-            HBRUSH hBrush = real_CreateSolidBrush(bg);
-            real_FillRect(hdc, pRect, hBrush);
-            DeleteObject(hBrush);
+            if (real_CreateSolidBrush && real_FillRect) {
+                HBRUSH hBrush = real_CreateSolidBrush(bg);
+                if (hBrush) {
+                    real_FillRect(hdc, pRect, hBrush);
+                    DeleteObject(hBrush);
+                }
+            }
             return S_OK;
         }
     }
@@ -564,46 +675,70 @@ HRESULT WINAPI DrawThemeBackground_Hook(HTHEME hTheme, HDC hdc, int iPartId, int
                 btnBorder = RGB(0, 120, 215); 
             }
             
-            HBRUSH hBrush = real_CreateSolidBrush(btnBg);
-            real_FillRect(hdc, pRect, hBrush);
-            DeleteObject(hBrush);
+            if (real_CreateSolidBrush && real_FillRect) {
+                HBRUSH hBrush = real_CreateSolidBrush(btnBg);
+                if (hBrush) {
+                    real_FillRect(hdc, pRect, hBrush);
+                    DeleteObject(hBrush);
+                }
+            }
             
-            HPEN hPen = real_CreatePen(PS_SOLID, 1, btnBorder);
-            HGDIOBJ oldPen = SelectObject(hdc, hPen);
-            HGDIOBJ oldBrush = SelectObject(hdc, real_GetStockObject(NULL_BRUSH));
-            Rectangle(hdc, pRect->left, pRect->top, pRect->right, pRect->bottom);
-            SelectObject(hdc, oldBrush);
-            SelectObject(hdc, oldPen);
-            DeleteObject(hPen);
+            if (real_CreatePen && real_GetStockObject) {
+                HPEN hPen = real_CreatePen(PS_SOLID, 1, btnBorder);
+                if (hPen) {
+                    HGDIOBJ oldPen = SelectObject(hdc, hPen);
+                    HGDIOBJ oldBrush = SelectObject(hdc, real_GetStockObject(NULL_BRUSH));
+                    Rectangle(hdc, pRect->left, pRect->top, pRect->right, pRect->bottom);
+                    SelectObject(hdc, oldBrush);
+                    SelectObject(hdc, oldPen);
+                    DeleteObject(hPen);
+                }
+            }
             return S_OK;
         }
     }
 
     if (cls && wcscmp(cls, L"TreeView") == 0) {
-        HBRUSH hThemeBrush = real_CreateSolidBrush(RGB(15, 15, 15));
-        real_FillRect(hdc, pRect, hThemeBrush);
-        DeleteObject(hThemeBrush);
+        if (real_CreateSolidBrush && real_FillRect) {
+            HBRUSH hThemeBrush = real_CreateSolidBrush(RGB(15, 15, 15));
+            if (hThemeBrush) {
+                real_FillRect(hdc, pRect, hThemeBrush);
+                DeleteObject(hThemeBrush);
+            }
+        }
         return S_OK;
     }
 
     if (cls && wcscmp(cls, L"Tab") == 0) {
-        HBRUSH hThemeBrush = real_CreateSolidBrush(RGB(20, 20, 20));
-        real_FillRect(hdc, pRect, hThemeBrush);
-        DeleteObject(hThemeBrush);
+        if (real_CreateSolidBrush && real_FillRect) {
+            HBRUSH hThemeBrush = real_CreateSolidBrush(RGB(20, 20, 20));
+            if (hThemeBrush) {
+                real_FillRect(hdc, pRect, hThemeBrush);
+                DeleteObject(hThemeBrush);
+            }
+        }
         return S_OK;
     }
     
     if (cls && wcscmp(cls, L"Header") == 0) {
-        HBRUSH hThemeBrush = real_CreateSolidBrush(RGB(30, 30, 30));
-        real_FillRect(hdc, pRect, hThemeBrush);
-        DeleteObject(hThemeBrush);
+        if (real_CreateSolidBrush && real_FillRect) {
+            HBRUSH hThemeBrush = real_CreateSolidBrush(RGB(30, 30, 30));
+            if (hThemeBrush) {
+                real_FillRect(hdc, pRect, hThemeBrush);
+                DeleteObject(hThemeBrush);
+            }
+        }
         
-        HPEN hPen = CreatePen(PS_SOLID, 1, RGB(60, 60, 60));
-        HGDIOBJ oldPen = SelectObject(hdc, hPen);
-        MoveToEx(hdc, pRect->right - 1, pRect->top, NULL);
-        LineTo(hdc, pRect->right - 1, pRect->bottom);
-        SelectObject(hdc, oldPen);
-        DeleteObject(hPen);
+        if (real_CreatePen) {
+            HPEN hPen = CreatePen(PS_SOLID, 1, RGB(60, 60, 60));
+            if (hPen) {
+                HGDIOBJ oldPen = SelectObject(hdc, hPen);
+                MoveToEx(hdc, pRect->right - 1, pRect->top, NULL);
+                LineTo(hdc, pRect->right - 1, pRect->bottom);
+                SelectObject(hdc, oldPen);
+                DeleteObject(hPen);
+            }
+        }
         return S_OK;
     }
     
@@ -611,9 +746,41 @@ HRESULT WINAPI DrawThemeBackground_Hook(HTHEME hTheme, HDC hdc, int iPartId, int
 }
 
 HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle, LPCWSTR lpszClassName, LPCWSTR lpszWindowName, DWORD dwStyle, int x, int y, int nWidth, int nHeight, HWND hwndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam) {
-    HWND hwnd = real_CreateWindowExW(dwExStyle, lpszClassName, lpszWindowName, dwStyle, x, y, nWidth, nHeight, hwndParent, hMenu, hInstance, lpParam);
+    HWND hwnd = real_CreateWindowExW ? real_CreateWindowExW(dwExStyle, lpszClassName, lpszWindowName, dwStyle, x, y, nWidth, nHeight, hwndParent, hMenu, hInstance, lpParam) : 
+                                     CreateWindowExW(dwExStyle, lpszClassName, lpszWindowName, dwStyle, x, y, nWidth, nHeight, hwndParent, hMenu, hInstance, lpParam);
+    
     if (hwnd) {
-        ApplyImmersiveDarkMode(hwnd);
+        DWORD pid;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == GetCurrentProcessId()) {
+            WCHAR szClass[64] = {0};
+            GetClassNameW(hwnd, szClass, 64);
+            
+            // Skip standard dialog classes entirely - let Windows handle them
+            if (wcscmp(szClass, L"#32770") != 0 && 
+                wcscmp(szClass, L"Edit") != 0 &&
+                wcscmp(szClass, L"Button") != 0 &&
+                wcscmp(szClass, L"ComboBox") != 0 &&
+                wcscmp(szClass, L"ListBox") != 0 &&
+                wcscmp(szClass, L"Static") != 0) {
+                
+                // Only apply DWM/theme attributes here, NOT subclassing
+                if (AllowDarkModeForWindow) AllowDarkModeForWindow(hwnd, TRUE);
+                
+                BOOL isTopLevel = !(dwStyle & WS_CHILD);
+                if (wcscmp(szClass, L"TaskManagerWindow") == 0 || isTopLevel) {
+                    if (real_SetWindowTheme) real_SetWindowTheme(hwnd, L"DarkMode", NULL);
+                } else {
+                    if (real_SetWindowTheme) real_SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
+                }
+                
+                if (isTopLevel && real_DwmSetWindowAttribute) {
+                    BOOL bDark = TRUE;
+                    real_DwmSetWindowAttribute(hwnd, 19, &bDark, sizeof(BOOL));
+                    real_DwmSetWindowAttribute(hwnd, 20, &bDark, sizeof(BOOL));
+                }
+            }
+        }
     }
     return hwnd;
 }
@@ -623,18 +790,41 @@ BOOL CALLBACK EnumChildWindowsProc(HWND child, LPARAM lParam) {
     return TRUE;
 }
 
+BOOL CALLBACK SafeSubclassEnumProc(HWND hwnd, LPARAM lParam) {
+    DWORD pid;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId() && !IsWindowSubclassed(hwnd)) {
+        WCHAR szClass[64] = {0};
+        GetClassNameW(hwnd, szClass, 64);
+        
+        // Only subclass top-level Task Manager windows, never dialogs or standard controls
+        BOOL isTopLevel = !(GetWindowLongW(hwnd, GWL_STYLE) & WS_CHILD);
+        if (isTopLevel && (wcscmp(szClass, L"TaskManagerWindow") == 0 || 
+                           wcscmp(szClass, L"NativeHWNDHost") == 0)) {
+            SetWindowSubclass(hwnd, TaskMgrSubclassProc, THEME_SUBCLASS_ID, 0);
+            MarkWindowSubclassed(hwnd);
+        }
+    }
+    return TRUE;
+}
+
 BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     DWORD pid;
     GetWindowThreadProcessId(hwnd, &pid);
     if (pid == GetCurrentProcessId()) {
-        ApplyImmersiveDarkMode(hwnd);
-        EnumChildWindows(hwnd, EnumChildWindowsProc, 0);
+        // Defer subclassing to avoid race conditions during window creation
+        PostMessage(hwnd, WM_NULL, 0, 0);
+        EnumChildWindows(hwnd, SafeSubclassEnumProc, 0);
         RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE | RDW_ALLCHILDREN);
     }
     return TRUE;
 }
 
 HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hwnd, DWORD dwAttribute, LPCVOID pvAttribute, DWORD cbAttribute) {
+    if (!real_DwmSetWindowAttribute) {
+        return DwmSetWindowAttribute(hwnd, dwAttribute, pvAttribute, cbAttribute);
+    }
+    
     if (dwAttribute == 19 || dwAttribute == 20) {
         BOOL bDark = TRUE;
         return real_DwmSetWindowAttribute(hwnd, dwAttribute, &bDark, sizeof(BOOL));
@@ -647,6 +837,10 @@ HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hwnd, DWORD dwAttribute, LPCVOID 
 }
 
 HRESULT WINAPI SetWindowTheme_Hook(HWND hwnd, LPCWSTR pszSubAppName, LPCWSTR pszSubIdList) {
+    if (!real_SetWindowTheme) {
+        return SetWindowTheme(hwnd, pszSubAppName, pszSubIdList);
+    }
+    
     WCHAR szClass[64] = {0};
     GetClassNameW(hwnd, szClass, 64);
     if (wcscmp(szClass, L"TaskManagerWindow") == 0) {
@@ -656,6 +850,10 @@ HRESULT WINAPI SetWindowTheme_Hook(HWND hwnd, LPCWSTR pszSubAppName, LPCWSTR psz
 }
 
 BOOL WINAPI GradientFill_Hook(HDC hdc, PTRIVERTEX pVertex, ULONG nVertex, PVOID pMesh, ULONG nMesh, ULONG ulMode) {
+    if (!real_GradientFill) {
+        return GradientFill(hdc, pVertex, nVertex, pMesh, nMesh, ulMode);
+    }
+    
     for (ULONG i = 0; i < nVertex; i++) {
         COLORREF color = RGB(pVertex[i].Red >> 8, pVertex[i].Green >> 8, pVertex[i].Blue >> 8);
         COLORREF newColor = ConvertTaskMgrColor(color, hdc);
@@ -669,6 +867,10 @@ BOOL WINAPI GradientFill_Hook(HDC hdc, PTRIVERTEX pVertex, ULONG nVertex, PVOID 
 }
 
 int WINAPI FillRect_Hook(HDC hdc, const RECT *lprc, HBRUSH hbr) {
+    if (!real_FillRect) {
+        return FillRect(hdc, lprc, hbr);
+    }
+    
     HWND hwnd = GetWindowFromDCExtended(hdc);
     if (hwnd) {
         WCHAR szClass[64] = {0};
@@ -676,16 +878,24 @@ int WINAPI FillRect_Hook(HDC hdc, const RECT *lprc, HBRUSH hbr) {
         
         // TARGET: The tab bar control
         if (wcscmp(szClass, L"SysTabControl32") == 0) {
-            HBRUSH hBlackBrush = CreateSolidBrush(RGB(0, 0, 0));
-            int result = real_FillRect(hdc, lprc, hBlackBrush);
-            DeleteObject(hBlackBrush);
-            return result;
+            if (real_CreateSolidBrush) {
+                HBRUSH hBlackBrush = real_CreateSolidBrush(RGB(0, 0, 0));
+                if (hBlackBrush) {
+                    int result = real_FillRect(hdc, lprc, hBlackBrush);
+                    DeleteObject(hBlackBrush);
+                    return result;
+                }
+            }
         }
     }
     return real_FillRect(hdc, lprc, hbr);
 }
 
 BOOL WINAPI ExtTextOutW_Hook(HDC hdc, int x, int y, UINT fuOptions, const RECT *lprect, LPCWSTR lpString, UINT cchString, CONST INT *lpDx) {
+    if (!real_ExtTextOutW) {
+        return ExtTextOutW(hdc, x, y, fuOptions, lprect, lpString, cchString, lpDx);
+    }
+    
     if (lpString && cchString > 0) {
         HWND hwnd = GetWindowFromDCExtended(hdc);
         if (hwnd) {
@@ -701,7 +911,9 @@ BOOL WINAPI ExtTextOutW_Hook(HDC hdc, int x, int y, UINT fuOptions, const RECT *
                     (cchString == 5 && wcsncmp(lpString, L"&View", 5) == 0)) {
                     
                     // Force the text color to black so it is readable on the white menu bar
-                    real_SetTextColor(hdc, RGB(0, 0, 0));
+                    if (real_SetTextColor) {
+                        real_SetTextColor(hdc, RGB(0, 0, 0));
+                    }
                 }
             }
         }
@@ -710,7 +922,7 @@ BOOL WINAPI ExtTextOutW_Hook(HDC hdc, int x, int y, UINT fuOptions, const RECT *
     if (fuOptions & ETO_OPAQUE && lprect) {
         COLORREF bkColor = GetBkColor(hdc);
         COLORREF newBkColor = ConvertTaskMgrColor(bkColor, hdc);
-        if (newBkColor != bkColor) {
+        if (newBkColor != bkColor && real_SetBkColor) {
             real_SetBkColor(hdc, newBkColor);
         }
     }
@@ -718,15 +930,21 @@ BOOL WINAPI ExtTextOutW_Hook(HDC hdc, int x, int y, UINT fuOptions, const RECT *
 }
 
 int WINAPI FillRgn_Hook(HDC hdc, HRGN hrgn, HBRUSH hbr) {
-    if (hbr) {
+    if (!real_FillRgn) {
+        return FillRgn(hdc, hrgn, hbr);
+    }
+    
+    if (hbr && real_CreateSolidBrush) {
         LOGBRUSH lb;
         if (GetObject(hbr, sizeof(LOGBRUSH), &lb)) {
             COLORREF newColor = ConvertTaskMgrColor(lb.lbColor, hdc);
             if (newColor != lb.lbColor) {
                 HBRUSH hNewBrush = real_CreateSolidBrush(newColor);
-                int result = real_FillRgn(hdc, hrgn, hNewBrush);
-                DeleteObject(hNewBrush);
-                return result;
+                if (hNewBrush) {
+                    int result = real_FillRgn(hdc, hrgn, hNewBrush);
+                    DeleteObject(hNewBrush);
+                    return result;
+                }
             }
         }
     }
@@ -734,7 +952,11 @@ int WINAPI FillRgn_Hook(HDC hdc, HRGN hrgn, HBRUSH hbr) {
 }
 
 int WINAPI FrameRgn_Hook(HDC hdc, HRGN hrgn, HBRUSH hbr, int w, int h) {
-    if (hbr) {
+    if (!real_FrameRgn) {
+        return FrameRgn(hdc, hrgn, hbr, w, h);
+    }
+    
+    if (hbr && real_CreateSolidBrush) {
         LOGBRUSH lb;
         if (GetObject(hbr, sizeof(LOGBRUSH), &lb)) {
             BYTE r = GetRValue(lb.lbColor);
@@ -742,9 +964,11 @@ int WINAPI FrameRgn_Hook(HDC hdc, HRGN hrgn, HBRUSH hbr, int w, int h) {
             BYTE b = GetBValue(lb.lbColor);
             if (r > 200 && g > 200 && b > 200) {
                 HBRUSH hDarkBrush = real_CreateSolidBrush(RGB(45, 45, 45));
-                int result = real_FrameRgn(hdc, hrgn, hDarkBrush, w, h);
-                DeleteObject(hDarkBrush);
-                return result;
+                if (hDarkBrush) {
+                    int result = real_FrameRgn(hdc, hrgn, hDarkBrush, w, h);
+                    DeleteObject(hDarkBrush);
+                    return result;
+                }
             }
         }
     }
