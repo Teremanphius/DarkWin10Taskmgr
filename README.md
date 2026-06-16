@@ -15,6 +15,12 @@ Also if you don't trust this, you don't have to do it
 4. Enable and click on compile
 5. Should work, enjoy!
 
+# Issues
+Of course there will be issues so here
+The modification might cause crashes
+The top menu bar isn't visible (File, Options, View)
+Opening, File > Run New task Crashes the taskmgr
+
 # How it looks:
 <img width="1193" height="1158" alt="image" src="https://github.com/user-attachments/assets/f2fa0666-9682-433b-bec5-5c9538e803bd" />
 
