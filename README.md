@@ -20,8 +20,6 @@ Also if you don't trust this, you don't have to do it
 
 The modification might cause crashes
 
-Opening, File > Run New task Crashes the taskmgr
-
 # How it looks:
 <img width="900" height="900" alt="image" src="https://github.com/user-attachments/assets/413d79e6-ee9c-4484-abce-7d912d106d71" />
 
