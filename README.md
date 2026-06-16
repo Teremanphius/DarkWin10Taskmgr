@@ -16,9 +16,12 @@ Also if you don't trust this, you don't have to do it
 5. Should work, enjoy!
 
 # Issues
-Of course there will be issues so here
+### Of course there will be issues so here:
+
 The modification might cause crashes
+
 The top menu bar isn't visible (File, Options, View)
+
 Opening, File > Run New task Crashes the taskmgr
 
 # How it looks:
