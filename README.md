@@ -20,11 +20,9 @@ Also if you don't trust this, you don't have to do it
 
 The modification might cause crashes
 
-The top menu bar isn't visible (File, Options, View)
-
 Opening, File > Run New task Crashes the taskmgr
 
 # How it looks:
-<img width="1193" height="1158" alt="image" src="https://github.com/user-attachments/assets/f2fa0666-9682-433b-bec5-5c9538e803bd" />
+<img width="900" height="900" alt="image" src="https://github.com/user-attachments/assets/413d79e6-ee9c-4484-abce-7d912d106d71" />
 
 not the best...
