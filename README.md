@@ -4,6 +4,8 @@ Any help would be nice, if you wanna contribute go right ahead, as I well.. Imma
 I made this for those who aren't big time picky, or just for those who want a task manager thats dark for windows 10, without really caring about much of the features of it
 
 Not the best thing, but still something.
+
+Also if you don't trust this, you don't have to do it
 # How Install? What do I do with the code?
 1. Get [Windhawk](https://windhawk.net/)
 2. In Windhawk click on (Create a New Mod)
