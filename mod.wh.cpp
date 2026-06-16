@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id           taskmgr-dark-mode-native
 // @name         Task Manager Native Dark Mode Fix
-// @description  Forces Task Manager into a native dark theme with perfect white chevrons, white tab text, dark title bars, and pitch black performance graphs.
-// @version      1.9.6
+// @description  Forces Task Manager into a native dark theme with perfect white chevrons, white tab text, dark title bars, dark top menu bars, and pitch black performance graphs.
+// @version      1.9.12
 // @author       Me
 // @include      taskmgr.exe
 // @compilerOptions -luxtheme -lgdi32 -luser32 -lcomctl32 -ldwmapi
@@ -24,15 +24,18 @@ pfnSetPreferredAppMode SetPreferredAppMode = NULL;
 pfnAllowDarkModeForWindow AllowDarkModeForWindow = NULL;
 pfnFlushMenuThemes FlushMenuThemes = NULL;
 
+
+
 struct ThemeTracking {
     HTHEME hTheme;
     WCHAR szClass[64];
 };
-ThemeTracking g_ThemeLog[32] = {0};
+// Expanded to 1024 to prevent the bottleneck that left menus white
+ThemeTracking g_ThemeLog[1024] = {0};
 int g_ThemeLogCount = 0;
 
 void RegisterTheme(HTHEME hTheme, LPCWSTR szClass) {
-    if (!hTheme || !szClass || g_ThemeLogCount >= 32) return;
+    if (!hTheme || !szClass || g_ThemeLogCount >= 1024) return;
     for (int i = 0; i < g_ThemeLogCount; i++) {
         if (g_ThemeLog[i].hTheme == hTheme) return;
     }
@@ -165,6 +168,13 @@ CreateCompatibleDC_t real_CreateCompatibleDC;
 using DeleteDC_t = BOOL (WINAPI *)(HDC hdc);
 DeleteDC_t real_DeleteDC;
 
+typedef BOOL (WINAPI* pfnExtTextOutW)(HDC hdc, int x, int y, UINT options, const RECT *lprc, LPCWSTR lpString, UINT c, const int *lpDx);
+typedef int (WINAPI* pfnDrawTextW)(HDC hdc, LPCWSTR lpchText, int cchText, LPRECT lprc, UINT format);
+typedef int (WINAPI* pfnDrawTextExW)(HDC hdc, LPWSTR lpchText, int cchText, LPRECT lprc, UINT format, LPDRAWTEXTPARAMS lpdtp);
+
+pfnDrawTextW real_DrawTextW = DrawTextW;
+pfnDrawTextExW real_DrawTextExW = DrawTextExW;
+
 COLORREF GetTargetBgColor(HDC hdc) {
     if (hdc) {
         HWND hwnd = GetWindowFromDCExtended(hdc);
@@ -172,14 +182,13 @@ COLORREF GetTargetBgColor(HDC hdc) {
             WCHAR szClass[64] = {0};
             GetClassNameW(hwnd, szClass, 64);
             if (wcscmp(szClass, L"NativeHWNDHost") == 0) {
-                return RGB(0, 0, 0); // Pitch black for performance graph canvases
+                return RGB(0, 0, 0); 
             }
         }
     }
-    return RGB(15, 15, 15); // Native UI dark panel color
+    return RGB(15, 15, 15); 
 }
 
-// Global smart color converter for dark theme scaling
 COLORREF ConvertTaskMgrColor(COLORREF color, HDC hdc) {
     BYTE r = GetRValue(color);
     BYTE g = GetGValue(color);
@@ -187,31 +196,24 @@ COLORREF ConvertTaskMgrColor(COLORREF color, HDC hdc) {
 
     COLORREF targetBg = GetTargetBgColor(hdc);
 
-    // Keep existing dark elements intact
     if (r < 45 && g < 45 && b < 45) {
         return color;
     }
 
-    // Standard bright light-mode neutrals (Window/Dialog background fields)
     if (r > 230 && g > 230 && b > 230 && abs((int)r - g) < 12 && abs((int)g - b) < 12) {
         return targetBg;
     }
 
-    // Calculate total layout color distance from pure white to measure load intensity
     int deficit = (255 - r) + (255 - g) + (255 - b);
 
-    // Completely clear out true 0% idle row/column slots so they hit the dark background natively
     if (deficit < 65) {
         return targetBg;
     }
 
-    // Map deficit range cleanly to an active scaling float
     float t = (float)(deficit - 65) / (500 - 65);
     if (t < 0.0f) t = 0.0f;
     if (t > 1.0f) t = 1.0f;
 
-    // Darkened gray palette matrix
-    // Lowest load steps begin at dark charcoal (30) up to peak capacity load maxing out at muted dark-medium gray (110)
     int minGrey = 30;
     int maxGrey = 110;
     int greyVal = minGrey + (int)(t * (maxGrey - minGrey));
@@ -241,20 +243,6 @@ BOOL IsSectionHeaderFill(HDC hdc, const RECT *lprc, COLORREF brushColor) {
 #define THEME_SUBCLASS_ID 1337
 LRESULT CALLBACK TaskMgrSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
     switch (uMsg) {
-        case WM_NCCREATE:
-        case WM_NCPAINT: {
-            BOOL bDark = TRUE;
-            real_DwmSetWindowAttribute(hwnd, 19, &bDark, sizeof(BOOL)); 
-            real_DwmSetWindowAttribute(hwnd, 20, &bDark, sizeof(BOOL)); 
-            
-            COLORREF titleBarColor = RGB(0, 0, 0);
-            COLORREF textColor = RGB(255, 255, 255);
-            real_DwmSetWindowAttribute(hwnd, 35, &titleBarColor, sizeof(COLORREF));
-            real_DwmSetWindowAttribute(hwnd, 36, &textColor, sizeof(COLORREF));
-
-            if (AllowDarkModeForWindow) AllowDarkModeForWindow(hwnd, TRUE);
-            break;
-        }
         case WM_CTLCOLORDLG:
         case WM_CTLCOLORSTATIC:
         case WM_CTLCOLORBTN:
@@ -276,6 +264,23 @@ LRESULT CALLBACK TaskMgrSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
             DeleteObject(hBrush);
             return 1;
         }
+        // Force title bar attributes continuously when window state triggers non-client repaints
+        case WM_NCACTIVATE:
+        case WM_NCPAINT:
+        case WM_WINDOWPOSCHANGED: {
+            BOOL isTopLevel = !(GetWindowLongW(hwnd, GWL_STYLE) & WS_CHILD);
+            if (isTopLevel && real_DwmSetWindowAttribute) {
+                BOOL bDark = TRUE;
+                real_DwmSetWindowAttribute(hwnd, 19, &bDark, sizeof(BOOL)); 
+                real_DwmSetWindowAttribute(hwnd, 20, &bDark, sizeof(BOOL)); 
+                
+                COLORREF titleBarColor = RGB(15, 15, 15);
+                COLORREF textColor = RGB(255, 255, 255);
+                real_DwmSetWindowAttribute(hwnd, 35, &titleBarColor, sizeof(COLORREF));
+                real_DwmSetWindowAttribute(hwnd, 36, &textColor, sizeof(COLORREF));
+            }
+            break;
+        }
     }
     return DefSubclassProc(hwnd, uMsg, wParam, lParam);
 }
@@ -283,16 +288,29 @@ LRESULT CALLBACK TaskMgrSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
 void ApplyImmersiveDarkMode(HWND hwnd) {
     if (!hwnd) return;
     
-    BOOL bDark = TRUE;
-    real_DwmSetWindowAttribute(hwnd, 19, &bDark, sizeof(BOOL)); 
-    real_DwmSetWindowAttribute(hwnd, 20, &bDark, sizeof(BOOL)); 
-    
-    COLORREF titleBarColor = RGB(0, 0, 0);
-    COLORREF textColor = RGB(255, 255, 255);
-    real_DwmSetWindowAttribute(hwnd, 35, &titleBarColor, sizeof(COLORREF));
-    real_DwmSetWindowAttribute(hwnd, 36, &textColor, sizeof(COLORREF));
+    WCHAR szClass[64] = {0};
+    GetClassNameW(hwnd, szClass, 64);
+    BOOL isTopLevel = !(GetWindowLongW(hwnd, GWL_STYLE) & WS_CHILD);
 
     if (AllowDarkModeForWindow) AllowDarkModeForWindow(hwnd, TRUE);
+    
+    // Prevent overriding the primary window frame layout with wrong explorer metrics
+    if (wcscmp(szClass, L"TaskManagerWindow") == 0 || isTopLevel) {
+        real_SetWindowTheme(hwnd, L"DarkMode", NULL);
+    } else {
+        real_SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
+    }
+
+    if (isTopLevel && real_DwmSetWindowAttribute) {
+        BOOL bDark = TRUE;
+        real_DwmSetWindowAttribute(hwnd, 19, &bDark, sizeof(BOOL)); 
+        real_DwmSetWindowAttribute(hwnd, 20, &bDark, sizeof(BOOL)); 
+        
+        COLORREF titleBarColor = RGB(15, 15, 15);
+        COLORREF textColor = RGB(255, 255, 255);
+        real_DwmSetWindowAttribute(hwnd, 35, &titleBarColor, sizeof(COLORREF));
+        real_DwmSetWindowAttribute(hwnd, 36, &textColor, sizeof(COLORREF));
+    }
     
     SetWindowSubclass(hwnd, TaskMgrSubclassProc, THEME_SUBCLASS_ID, 0);
     SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
@@ -340,8 +358,20 @@ COLORREF WINAPI SetTextColor_Hook(HDC hdc, COLORREF color) {
     if (hwnd) {
         WCHAR szClass[64] = {0};
         GetClassNameW(hwnd, szClass, 64);
+        
         if (wcscmp(szClass, L"NativeHWNDHost") == 0) {
             return real_SetTextColor(hdc, color);
+        }
+
+        // FIX: Target the main window frame where the classic menu bar lives
+        if (wcscmp(szClass, L"TaskManagerWindow") == 0) {
+            BYTE r = GetRValue(color);
+            BYTE g = GetGValue(color);
+            BYTE b = GetBValue(color);
+            // If the system tries to draw dark text (File, Options, View), force it to stay crisp black
+            if (r < 150 && g < 150 && b < 150) {
+                return real_SetTextColor(hdc, RGB(0, 0, 0));
+            }
         }
     }
 
@@ -375,7 +405,7 @@ COLORREF WINAPI SetDCPenColor_Hook(HDC hdc, COLORREF color) {
     BYTE g = GetGValue(color);
     BYTE b = GetBValue(color);
     if (r > 200 && g > 200 && b > 200) {
-        return real_SetDCPenColor(hdc, RGB(45, 45, 45)); // Dark grid boundaries
+        return real_SetDCPenColor(hdc, RGB(45, 45, 45)); 
     }
     return real_SetDCPenColor(hdc, color);
 }
@@ -458,23 +488,112 @@ HTHEME WINAPI OpenThemeData_Hook(HWND hwnd, LPCWSTR pszClassList) {
 }
 
 HRESULT WINAPI DrawThemeBackground_Hook(HTHEME hTheme, HDC hdc, int iPartId, int iStateId, const RECT *pRect, const RECT *pClipRect) {
-    LPCWSTR cls = GetThemeClassName(hTheme);
+    LPCWSTR cls = hTheme ? GetThemeClassName(hTheme) : NULL;
     
-    if (wcscmp(cls, L"TreeView") == 0) {
+    HWND hwnd = WindowFromDC(hdc);
+    WCHAR szClass[64] = {0};
+    if (hwnd) {
+        GetClassNameW(hwnd, szClass, 64);
+        
+        // FIX 1: Force the topmost title bar / caption frame to turn black
+        if (wcscmp(szClass, L"TaskManagerWindow") == 0) {
+            BOOL useDarkMode = TRUE;
+            DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &useDarkMode, sizeof(useDarkMode));
+            DwmSetWindowAttribute(hwnd, 19, &useDarkMode, sizeof(useDarkMode)); // Fallback for older Win10 builds
+        }
+    }
+
+    // Check if this is a standard menu class string
+    BOOL isMenu = (cls && (wcscmp(cls, L"Menu") == 0 || wcsstr(cls, L"Menu") != NULL));
+    
+    if (wcscmp(szClass, L"TaskManagerWindow") == 0 && (iPartId == 7 || iPartId == 8)) {
+        isMenu = TRUE;
+    }
+    
+    if (isMenu) {
+        if (iPartId == 7) { // MENU_BARBACKGROUND
+            HBRUSH hBrush = real_CreateSolidBrush(RGB(0, 0, 0)); // Pure Black
+            real_FillRect(hdc, pRect, hBrush);
+            DeleteObject(hBrush);
+            return S_OK;
+        }
+        if (iPartId == 8) { // MENU_BARITEM
+            COLORREF bg = RGB(0, 0, 0); // Pure Black when idle
+            if (iStateId == 2 || iStateId == 3) { // MBI_HOT or MBI_PUSHED
+                bg = RGB(55, 55, 55); 
+            }
+            HBRUSH hBrush = real_CreateSolidBrush(bg);
+            real_FillRect(hdc, pRect, hBrush);
+            DeleteObject(hBrush);
+            return S_OK;
+        }
+        if (iPartId == 9) { // MENU_POPUPBACKGROUND
+            HBRUSH hBrush = real_CreateSolidBrush(RGB(25, 25, 25));
+            real_FillRect(hdc, pRect, hBrush);
+            DeleteObject(hBrush);
+            return S_OK;
+        }
+        if (iPartId == 14) { // MENU_POPUPITEM
+            COLORREF bg = RGB(25, 25, 25);
+            if (iStateId == 2) { // MPI_HOT
+                bg = RGB(50, 50, 50);
+            }
+            HBRUSH hBrush = real_CreateSolidBrush(bg);
+            real_FillRect(hdc, pRect, hBrush);
+            DeleteObject(hBrush);
+            return S_OK;
+        }
+    }
+
+    if (cls && wcscmp(cls, L"Button") == 0) {
+        if (iPartId == 1) { // BP_PUSHBUTTON
+            COLORREF btnBg = RGB(45, 45, 45);
+            COLORREF btnBorder = RGB(80, 80, 80);
+            
+            if (iStateId == 2) { // PBS_HOT
+                btnBg = RGB(65, 65, 65);
+                btnBorder = RGB(110, 110, 110);
+            } else if (iStateId == 3) { // PBS_PRESSED
+                btnBg = RGB(25, 25, 25);
+                btnBorder = RGB(60, 60, 60);
+            } else if (iStateId == 4) { // PBS_DISABLED
+                btnBg = RGB(30, 30, 30);
+                btnBorder = RGB(45, 45, 45);
+            } else if (iStateId == 5) { // PBS_DEFAULTED
+                btnBg = RGB(45, 45, 45);
+                btnBorder = RGB(0, 120, 215); 
+            }
+            
+            HBRUSH hBrush = real_CreateSolidBrush(btnBg);
+            real_FillRect(hdc, pRect, hBrush);
+            DeleteObject(hBrush);
+            
+            HPEN hPen = real_CreatePen(PS_SOLID, 1, btnBorder);
+            HGDIOBJ oldPen = SelectObject(hdc, hPen);
+            HGDIOBJ oldBrush = SelectObject(hdc, real_GetStockObject(NULL_BRUSH));
+            Rectangle(hdc, pRect->left, pRect->top, pRect->right, pRect->bottom);
+            SelectObject(hdc, oldBrush);
+            SelectObject(hdc, oldPen);
+            DeleteObject(hPen);
+            return S_OK;
+        }
+    }
+
+    if (cls && wcscmp(cls, L"TreeView") == 0) {
         HBRUSH hThemeBrush = real_CreateSolidBrush(RGB(15, 15, 15));
         real_FillRect(hdc, pRect, hThemeBrush);
         DeleteObject(hThemeBrush);
         return S_OK;
     }
 
-    if (wcscmp(cls, L"Tab") == 0) {
+    if (cls && wcscmp(cls, L"Tab") == 0) {
         HBRUSH hThemeBrush = real_CreateSolidBrush(RGB(20, 20, 20));
         real_FillRect(hdc, pRect, hThemeBrush);
         DeleteObject(hThemeBrush);
         return S_OK;
     }
     
-    if (wcscmp(cls, L"Header") == 0) {
+    if (cls && wcscmp(cls, L"Header") == 0) {
         HBRUSH hThemeBrush = real_CreateSolidBrush(RGB(30, 30, 30));
         real_FillRect(hdc, pRect, hThemeBrush);
         DeleteObject(hThemeBrush);
@@ -521,17 +640,19 @@ HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hwnd, DWORD dwAttribute, LPCVOID 
         return real_DwmSetWindowAttribute(hwnd, dwAttribute, &bDark, sizeof(BOOL));
     }
     if (dwAttribute == 35 || dwAttribute == 36) {
-        COLORREF col = (dwAttribute == 35) ? RGB(0, 0, 0) : RGB(255, 255, 255);
+        COLORREF col = (dwAttribute == 35) ? RGB(15, 15, 15) : RGB(255, 255, 255);
         return real_DwmSetWindowAttribute(hwnd, dwAttribute, &col, sizeof(COLORREF));
     }
     return real_DwmSetWindowAttribute(hwnd, dwAttribute, pvAttribute, cbAttribute);
 }
 
 HRESULT WINAPI SetWindowTheme_Hook(HWND hwnd, LPCWSTR pszSubAppName, LPCWSTR pszSubIdList) {
-    if (pszSubAppName && (wcscmp(pszSubAppName, L"Explorer") == 0 || wcscmp(pszSubAppName, L"ListView") == 0 || wcscmp(pszSubAppName, L"TreeView") == 0)) {
-        return real_SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
+    WCHAR szClass[64] = {0};
+    GetClassNameW(hwnd, szClass, 64);
+    if (wcscmp(szClass, L"TaskManagerWindow") == 0) {
+        return real_SetWindowTheme(hwnd, L"DarkMode", NULL);
     }
-    return real_SetWindowTheme(hwnd, pszSubAppName, pszSubIdList);
+    return real_SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
 }
 
 BOOL WINAPI GradientFill_Hook(HDC hdc, PTRIVERTEX pVertex, ULONG nVertex, PVOID pMesh, ULONG nMesh, ULONG ulMode) {
@@ -548,29 +669,44 @@ BOOL WINAPI GradientFill_Hook(HDC hdc, PTRIVERTEX pVertex, ULONG nVertex, PVOID 
 }
 
 int WINAPI FillRect_Hook(HDC hdc, const RECT *lprc, HBRUSH hbr) {
-    if (hbr) {
-        LOGBRUSH lb;
-        if (GetObject(hbr, sizeof(LOGBRUSH), &lb)) {
-            if (IsSectionHeaderFill(hdc, lprc, lb.lbColor)) {
-                HBRUSH hDarkBrush = real_CreateSolidBrush(GetTargetBgColor(hdc));
-                int result = real_FillRect(hdc, lprc, hDarkBrush);
-                DeleteObject(hDarkBrush);
-                return result;
-            }
-            
-            COLORREF newColor = ConvertTaskMgrColor(lb.lbColor, hdc);
-            if (newColor != lb.lbColor) {
-                HBRUSH hNewBrush = real_CreateSolidBrush(newColor);
-                int result = real_FillRect(hdc, lprc, hNewBrush);
-                DeleteObject(hNewBrush);
-                return result;
-            }
+    HWND hwnd = GetWindowFromDCExtended(hdc);
+    if (hwnd) {
+        WCHAR szClass[64] = {0};
+        GetClassNameW(hwnd, szClass, 64);
+        
+        // TARGET: The tab bar control
+        if (wcscmp(szClass, L"SysTabControl32") == 0) {
+            HBRUSH hBlackBrush = CreateSolidBrush(RGB(0, 0, 0));
+            int result = real_FillRect(hdc, lprc, hBlackBrush);
+            DeleteObject(hBlackBrush);
+            return result;
         }
     }
     return real_FillRect(hdc, lprc, hbr);
 }
 
 BOOL WINAPI ExtTextOutW_Hook(HDC hdc, int x, int y, UINT fuOptions, const RECT *lprect, LPCWSTR lpString, UINT cchString, CONST INT *lpDx) {
+    if (lpString && cchString > 0) {
+        HWND hwnd = GetWindowFromDCExtended(hdc);
+        if (hwnd) {
+            WCHAR szClass[64] = {0};
+            GetClassNameW(hwnd, szClass, 64);
+            // Ensure we are only targeting text drawn directly on the main Task Manager window frame
+            if (wcscmp(szClass, L"TaskManagerWindow") == 0) {
+                if ((cchString == 4 && wcsncmp(lpString, L"File", 4) == 0) ||
+                    (cchString == 5 && wcsncmp(lpString, L"&File", 5) == 0) ||
+                    (cchString == 7 && wcsncmp(lpString, L"Options", 7) == 0) ||
+                    (cchString == 8 && wcsncmp(lpString, L"&Options", 8) == 0) ||
+                    (cchString == 4 && wcsncmp(lpString, L"View", 4) == 0) ||
+                    (cchString == 5 && wcsncmp(lpString, L"&View", 5) == 0)) {
+                    
+                    // Force the text color to black so it is readable on the white menu bar
+                    real_SetTextColor(hdc, RGB(0, 0, 0));
+                }
+            }
+        }
+    }
+
     if (fuOptions & ETO_OPAQUE && lprect) {
         COLORREF bkColor = GetBkColor(hdc);
         COLORREF newBkColor = ConvertTaskMgrColor(bkColor, hdc);
